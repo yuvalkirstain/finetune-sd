@@ -1,0 +1,61 @@
+general:
+  output_dir: outputs/finetune_sd
+  overwrite_output_dir: true
+  logging_dir: logs
+  report_to: wandb
+  cache_dir: null
+  max_ckpts_to_keep: 3
+
+training:
+  gradient_accumulation_steps: 1
+  mixed_precision: "no"
+  seed: 42
+  pretrained_model_name_or_path: runwayml/stable-diffusion-v1-5
+  gradient_checkpointing: true
+  train_batch_size: 1
+  validation_batch_size: 1
+  resolution: 512
+  max_train_steps: 10000
+  num_train_epochs: 10
+  use_ema: false
+  validate_steps: 100
+  save_steps: 1000 # ${training.validate_steps}
+  max_batches_to_generate: 8
+  classifier_free_ratio: 0.1
+  enable_xformers_memory_efficient_attention: false
+  eval_clip_id: openai/clip-vit-large-patch14
+  n_eval_steps: 25
+  gs: 9
+  num_workers: 3
+
+dataset:
+  dataset_name: yuvalkirstain/beautiful_interesting_spectacular_photo_model_30000
+  dataset_config_name: null
+  image_column_name: image
+  caption_column_name: text
+  bad_image_column_name: bad_image
+
+optimizer:
+  learning_rate: 1e-6
+  scale_lr: false
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 1e-2
+  adam_epsilon: 1e-8
+  max_grad_norm: 1.0
+
+lr_scheduler:
+  type: constant_with_warmup
+  lr_warmup_steps: 500
+
+hf:
+  push_to_hub: true
+  hub_model_id: null
+
+debug:
+  activate: false
+  port: 5900
+
+hydra:
+  run:
+    dir: .
