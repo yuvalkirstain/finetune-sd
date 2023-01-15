@@ -175,6 +175,10 @@ class EMAModel:
                 raise ValueError("collected_params and shadow_params must have the same length")
 
 
+def get_allocated_cuda_memory():
+    return round(torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024, 2)
+
+
 @hydra.main(config_path="../../configs/finetune", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     logging_dir = os.path.join(cfg.general.output_dir, cfg.general.logging_dir)
@@ -364,6 +368,11 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Moving text encoder and vae to GPU with weight dtype {weight_dtype}")
     text_encoder = text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae = vae.to(accelerator.device, dtype=weight_dtype)
+
+    pipeline.unet = unet
+
+    logger.info(f"GPU memory usage before training {get_allocated_cuda_memory()}")
+
     if cfg.training.use_ema:
         ema_unet.to(accelerator.device, dtype=weight_dtype)
 
@@ -378,10 +387,133 @@ def main(cfg: DictConfig) -> None:
         accelerator.init_trackers("text2image-fine-tune", config=OmegaConf.to_object(cfg))
 
     logger.info("Preparing unconditional input")
-    # Prepare unconditional input ids for classifier-free training
-    unconditional_input_ids = tokenizer("", max_length=tokenizer.model_max_length, padding="max_length",
-                                        truncation=True, return_tensors="pt").input_ids
-    unconditional_input_ids = unconditional_input_ids.to(accelerator.device)
+
+    def train_forward(batch):
+        pixel_values = batch["pixel_values"]
+        input_ids = batch["input_ids"]
+
+        # classifier free
+        unconditional_input_ids = tokenizer("", max_length=tokenizer.model_max_length, padding="max_length",
+                                            truncation=True, return_tensors="pt").input_ids
+        unconditional_input_ids = unconditional_input_ids.to(accelerator.device)
+        classifier_free_mask = torch.rand(size=(input_ids.shape[0],)) < cfg.training.classifier_free_ratio
+        input_ids[classifier_free_mask] = unconditional_input_ids
+
+        latents = vae.encode(pixel_values.to(weight_dtype)).latent_dist.sample()
+        latents = latents * 0.18215
+
+        # Sample noise that we'll add to the latents
+        noise = torch.randn_like(latents)
+        bsz = latents.shape[0]
+        # Sample a random timestep for each image
+        timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
+        timesteps = timesteps.long()
+
+        # Add noise to the latents according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        # Get the text embedding for conditioning
+        encoder_hidden_states = text_encoder(input_ids)[0]
+
+        # Get the target for loss depending on the prediction type
+        if noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif noise_scheduler.config.prediction_type == "v_prediction":
+            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+        # Predict the noise residual and compute loss
+        model_out = unet(noisy_latents, timesteps, encoder_hidden_states)
+        model_pred = model_out.sample
+        return model_pred, target
+
+    def train_step(batch):
+        model_pred, target = train_forward(batch)
+
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+        # Gather the losses across all processes for logging (if we use distributed training).
+        avg_loss = accelerator.gather(loss).mean().item()
+
+        # Backpropagate
+        accelerator.backward(loss)
+        if accelerator.sync_gradients:
+            accelerator.clip_grad_norm_(unet.parameters(), cfg.optimizer.max_grad_norm)
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+        return avg_loss
+
+    @torch.no_grad()
+    def get_image_scores(caption, img, gt_img):
+        inputs = clip_processor(text=[caption], truncation=True, padding="max_length", max_length=77,
+                                images=[img, gt_img],
+                                return_tensors="pt").to(accelerator.device)
+        image_features = clip_model.get_image_features(inputs["pixel_values"].to(torch.float16))
+        text_features = clip_model.get_text_features(inputs["input_ids"])
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        prompt_scores = text_features @ image_features.T
+        img_score, gt_img_score = prompt_scores[0, 0].item(), prompt_scores[0, 1].item()
+        img_score = round(img_score, 3)
+        gt_img_score = round(gt_img_score, 3)
+        return img_score, gt_img_score
+
+    def evaluate():
+        logger.info("***** Generating from Validation *****")
+        unet.eval()
+        pipeline.set_progress_bar_config(disable=True)
+
+        valid_progress_bar = tqdm(disable=not accelerator.is_main_process)
+        valid_progress_bar.set_description("#Batches Generated")
+        captions, images, gt_images = [], [], []
+        generator = torch.Generator(device=accelerator.device)
+
+        for eval_step, val_batch in enumerate(validation_dataloader):
+            batch_captions = tokenizer.batch_decode(val_batch["input_ids"], skip_special_tokens=True)
+            generator.manual_seed(cfg.training.seed)
+            batch_images = pipeline(batch_captions,
+                                    guidance_scale=cfg.training.gs,
+                                    generator=generator,
+                                    num_inference_steps=cfg.training.n_eval_steps).images
+            captions.extend(batch_captions)
+            images.extend(batch_images)
+            gt_images.extend(pixel_values_to_pil_images(val_batch["pixel_values"]))
+            valid_progress_bar.update(1)
+            if len(captions) >= cfg.training.max_batches_to_generate * cfg.training.validation_batch_size:
+                break
+
+        scores, gt_scores = [], []
+        for caption, img, gt_img in zip(captions, images, gt_images):
+            img_score, gt_img_score = get_image_scores(caption, img, gt_img)
+            scores.append(img_score)
+            gt_scores.append(gt_img_score)
+
+        # Log predictions
+        if cfg.general.report_to == "wandb" and accelerator.is_main_process:
+            logger.info("Uploading to wandb")
+            images = [wandb.Image(img) for img in images]
+            gt_images = [wandb.Image(img) for img in gt_images]
+            predictions = [captions, images, gt_images, scores, gt_scores,
+                           [global_step] * len(captions)]
+            columns = ["prompt", "image", "gt_image", "score", "gt_score", "global_step"]
+            data = list(zip(*predictions))
+            table = wandb.Table(columns=columns, data=data)
+            wandb.log({"test_predictions": table}, commit=False, step=global_step)
+
+        logger.info(f"Finished Validation")
+        torch.cuda.empty_cache()
+        unet.train()
+        accelerator.wait_for_everyone()
+
+    def clean_ckpts():
+        all_ckpts = list(glob(os.path.join(cfg.general.output_dir, f"global_step*")))
+        all_ckpts.sort(key=os.path.getctime)
+        if len(all_ckpts) > cfg.general.max_ckpts_to_keep:
+            for ckpt in all_ckpts[:-cfg.general.max_ckpts_to_keep]:
+                shutil.rmtree(ckpt)
 
     logger.info("Training")
     # Train!
@@ -405,56 +537,10 @@ def main(cfg: DictConfig) -> None:
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
-                pixel_values = batch["pixel_values"]
-                input_ids = batch["input_ids"]
-
-                # classifier free
-                classifier_free_mask = torch.rand(size=(input_ids.shape[0],)) < cfg.training.classifier_free_ratio
-                input_ids[classifier_free_mask] = unconditional_input_ids
-
-                latents = vae.encode(pixel_values.to(weight_dtype)).latent_dist.sample()
-                latents = latents * 0.18215
-
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(input_ids)[0]
-
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                # Predict the noise residual and compute loss
-                model_out = unet(noisy_latents, timesteps, encoder_hidden_states)
-                model_pred = model_out.sample
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss).mean()
-                train_loss += avg_loss.item() / cfg.training.gradient_accumulation_steps
-
-                # Backpropagate
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), cfg.optimizer.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                avg_loss = train_step(batch)
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
+                train_loss += avg_loss / cfg.training.gradient_accumulation_steps
                 if accelerator.sync_gradients:
                     if cfg.training.use_ema:
                         ema_unet.step(unet.parameters())
@@ -470,9 +556,9 @@ def main(cfg: DictConfig) -> None:
                         step=global_step)
                     train_loss = 0.0
 
-                cuda_gb_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
+                cuda_gb_allocated = get_allocated_cuda_memory()
                 logs = {
-                    "step_loss": loss.detach().item(),
+                    "step_loss": avg_loss,
                     "lr": lr_scheduler.get_last_lr()[0],
                     "mem": cuda_gb_allocated,
                     "epoch": epoch
@@ -481,78 +567,21 @@ def main(cfg: DictConfig) -> None:
 
                 # Save checkpoint
                 if accelerator.sync_gradients and global_step % cfg.training.save_steps == 0:
-                    save_dir = cfg.general.output_dir
-                    os.makedirs(save_dir, exist_ok=True)
                     if cfg.training.use_ema:
                         # TODO not sure if this is the right way to do it
                         ema_unet.copy_to(unet.parameters())
+                    save_dir = cfg.general.output_dir
+                    os.makedirs(save_dir, exist_ok=True)
                     save_dir = os.path.join(cfg.general.output_dir, f"global_step_{global_step}")
                     accelerator.save_state(save_dir)
                     if accelerator.is_main_process:
-                        all_ckpts = list(glob(os.path.join(cfg.general.output_dir, f"global_step*")))
-                        all_ckpts.sort(key=os.path.getctime)
-                        if len(all_ckpts) > cfg.general.max_ckpts_to_keep:
-                            for ckpt in all_ckpts[:-cfg.general.max_ckpts_to_keep]:
-                                shutil.rmtree(ckpt)
+                        clean_ckpts()
 
                 # Evaluate
                 is_start_train = step == 0 and epoch == 0
                 should_eval = accelerator.sync_gradients and global_step % cfg.training.validate_steps == 0
                 if is_start_train or should_eval:
-                    logger.info("***** Generating from Validation *****")
-                    unet.eval()
-                    torch.cuda.empty_cache()
-                    pipeline.set_progress_bar_config(disable=True)
-
-                    valid_progress_bar = tqdm(disable=not accelerator.is_main_process)
-                    valid_progress_bar.set_description("#Batches Generated")
-                    captions, images, gt_images = [], [], []
-                    generator = torch.Generator(device=accelerator.device)
-
-                    for eval_step, val_batch in enumerate(validation_dataloader):
-                        batch_captions = tokenizer.batch_decode(val_batch["input_ids"], skip_special_tokens=True)
-                        generator.manual_seed(cfg.training.seed)
-                        batch_images = pipeline(batch_captions,
-                                                guidance_scale=cfg.training.gs,
-                                                generator=generator,
-                                                num_inference_steps=cfg.training.n_eval_steps).images
-                        captions.extend(batch_captions)
-                        images.extend(batch_images)
-                        gt_images.extend(pixel_values_to_pil_images(val_batch["pixel_values"]))
-                        valid_progress_bar.update(1)
-                        if len(captions) >= cfg.training.max_batches_to_generate * cfg.training.validation_batch_size:
-                            break
-
-                    scores, gt_scores = [], []
-                    for caption, img, gt_img in zip(captions, images, gt_images):
-                        inputs = clip_processor(text=[caption], truncation=True, padding="max_length", max_length=77,
-                                                images=[img, gt_img],
-                                                return_tensors="pt").to(accelerator.device)
-                        image_features = clip_model.get_image_features(inputs["pixel_values"].to(torch.float16))
-                        text_features = clip_model.get_text_features(inputs["input_ids"])
-                        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-                        prompt_scores = text_features @ image_features.T
-                        img_score, gt_img_score = prompt_scores[0, 0].item(), prompt_scores[0, 1].item()
-                        scores.append(round(img_score, 3))
-                        gt_scores.append(round(gt_img_score, 3))
-
-                    # Log predictions
-                    if cfg.general.report_to == "wandb" and accelerator.is_main_process:
-                        logger.info("Uploading to wandb")
-                        images = [wandb.Image(img) for img in images]
-                        gt_images = [wandb.Image(img) for img in gt_images]
-                        predictions = [captions, images, gt_images, scores, gt_scores,
-                                       [global_step] * len(captions)]
-                        columns = ["prompt", "image", "gt_image", "score", "gt_score", "global_step"]
-                        data = list(zip(*predictions))
-                        table = wandb.Table(columns=columns, data=data)
-                        wandb.log({"test_predictions": table}, commit=False, step=global_step)
-
-                    logger.info(f"Finished Validation")
-                    torch.cuda.empty_cache()
-                    unet.train()
-                    accelerator.wait_for_everyone()
+                    evaluate()
 
             if global_step >= cfg.training.max_train_steps:
                 break
