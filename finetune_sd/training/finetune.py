@@ -26,6 +26,8 @@ from transformers import CLIPModel, CLIPProcessor
 from torchvision import transforms
 import torch.nn.functional as F
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 logger = get_logger(__name__)
 
 
@@ -69,118 +71,181 @@ def pixel_values_to_pil_images(pixel_values):
     return images
 
 
-class EMAModel:
-    """
-    Exponential Moving Average of models weights
-    """
-
-    def __init__(self, parameters: Iterable[torch.nn.Parameter], decay=0.9999):
-        parameters = list(parameters)
-        self.shadow_params = [p.clone().detach() for p in parameters]
-
-        self.collected_params = None
-
-        self.decay = decay
-        self.optimization_step = 0
-
-    @torch.no_grad()
-    def step(self, parameters):
-        parameters = list(parameters)
-
-        self.optimization_step += 1
-
-        # Compute the decay factor for the exponential moving average.
-        value = (1 + self.optimization_step) / (10 + self.optimization_step)
-        one_minus_decay = 1 - min(self.decay, value)
-
-        for s_param, param in zip(self.shadow_params, parameters):
-            if param.requires_grad:
-                s_param.sub_(one_minus_decay * (s_param - param))
-            else:
-                s_param.copy_(param)
-
-        torch.cuda.empty_cache()
-
-    def copy_to(self, parameters: Iterable[torch.nn.Parameter]) -> None:
-        """
-        Copy current averaged parameters into given collection of parameters.
-        Args:
-            parameters: Iterable of `torch.nn.Parameter`; the parameters to be
-                updated with the stored moving averages. If `None`, the
-                parameters with which this `ExponentialMovingAverage` was
-                initialized will be used.
-        """
-        parameters = list(parameters)
-        for s_param, param in zip(self.shadow_params, parameters):
-            param.data.copy_(s_param.data)
-
-    def to(self, device=None, dtype=None) -> None:
-        r"""Move internal buffers of the ExponentialMovingAverage to `device`.
-        Args:
-            device: like `device` argument to `torch.Tensor.to`
-        """
-        # .to() on the tensors handles None correctly
-        self.shadow_params = [
-            p.to(device=device, dtype=dtype) if p.is_floating_point() else p.to(device=device)
-            for p in self.shadow_params
-        ]
-
-    def state_dict(self) -> dict:
-        r"""
-        Returns the state of the ExponentialMovingAverage as a dict.
-        This method is used by accelerate during checkpointing to save the ema state dict.
-        """
-        # Following PyTorch conventions, references to tensors are returned:
-        # "returns a reference to the state and not its copy!" -
-        # https://pytorch.org/tutorials/beginner/saving_loading_models.html#what-is-a-state-dict
-        return {
-            "decay": self.decay,
-            "optimization_step": self.optimization_step,
-            "shadow_params": self.shadow_params,
-            "collected_params": self.collected_params,
-        }
-
-    def load_state_dict(self, state_dict: dict) -> None:
-        r"""
-        Loads the ExponentialMovingAverage state.
-        This method is used by accelerate during checkpointing to save the ema state dict.
-        Args:
-            state_dict (dict): EMA state. Should be an object returned
-                from a call to :meth:`state_dict`.
-        """
-        # deepcopy, to be consistent with module API
-        state_dict = copy.deepcopy(state_dict)
-
-        self.decay = state_dict["decay"]
-        if self.decay < 0.0 or self.decay > 1.0:
-            raise ValueError("Decay must be between 0 and 1")
-
-        self.optimization_step = state_dict["optimization_step"]
-        if not isinstance(self.optimization_step, int):
-            raise ValueError("Invalid optimization_step")
-
-        self.shadow_params = state_dict["shadow_params"]
-        if not isinstance(self.shadow_params, list):
-            raise ValueError("shadow_params must be a list")
-        if not all(isinstance(p, torch.Tensor) for p in self.shadow_params):
-            raise ValueError("shadow_params must all be Tensors")
-
-        self.collected_params = state_dict["collected_params"]
-        if self.collected_params is not None:
-            if not isinstance(self.collected_params, list):
-                raise ValueError("collected_params must be a list")
-            if not all(isinstance(p, torch.Tensor) for p in self.collected_params):
-                raise ValueError("collected_params must all be Tensors")
-            if len(self.collected_params) != len(self.shadow_params):
-                raise ValueError("collected_params and shadow_params must have the same length")
-
-
 def get_allocated_cuda_memory():
     return round(torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024, 2)
 
 
+class Model(torch.nn.Module):
+
+    def __init__(
+            self,
+            unet,
+            text_encoder,
+            vae,
+            unconditional_input_ids,
+            classifier_free_ratio,
+            noise_scheduler,
+            use_pixel_loss
+    ):
+        super().__init__()
+        self.unet = unet
+        self.text_encoder = text_encoder
+        self.vae = vae
+        self.unconditional_input_ids = unconditional_input_ids
+        self.classifier_free_ratio = classifier_free_ratio
+        self.noise_scheduler = noise_scheduler
+        self.use_pixel_loss = use_pixel_loss
+
+    def get_image_pred(self, model_output, timestep, sample):
+
+        t = timestep
+
+        if model_output.shape[1] == sample.shape[1] * 2 and self.variance_type in ["learned", "learned_range"]:
+            model_output, predicted_variance = torch.split(model_output, sample.shape[1], dim=1)
+
+        # 1. compute alphas, betas
+        alpha_prod_t = self.noise_scheduler.alphas_cumprod[t][:, None, None, None]
+        beta_prod_t = 1 - alpha_prod_t
+
+        # 2. compute predicted original sample from predicted noise also called
+        # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
+        if self.noise_scheduler.config.prediction_type == "epsilon":
+            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+        elif self.noise_scheduler.config.prediction_type == "sample":
+            pred_original_sample = model_output
+        elif self.noise_scheduler.config.prediction_type == "v_prediction":
+            pred_original_sample = (alpha_prod_t ** 0.5) * sample - (beta_prod_t ** 0.5) * model_output
+        else:
+            raise ValueError(
+                f"prediction_type given as {self.noise_scheduler.config.prediction_type} must be one of `epsilon`, `sample` or"
+                " `v_prediction`  for the DDPMScheduler."
+            )
+
+        # 3. Clip "predicted x_0"
+        if self.noise_scheduler.config.clip_sample:
+            pred_original_sample = torch.clamp(pred_original_sample, -1, 1)
+
+        return pred_original_sample
+
+    @torch.no_grad()
+    def encode_image(self, image):
+        latents = self.vae.encode(image).latent_dist.sample()
+        latents = latents * 0.18215
+        return latents
+
+    def decode_latents(self, latents):
+        latents = (1 / 0.18215) * latents
+        image = self.vae.decode(latents).sample
+        return image
+
+    def forward(self, pixel_values, input_ids):
+
+        # classifier free
+        classifier_free_mask = torch.rand(size=(input_ids.shape[0],)) < self.classifier_free_ratio
+        input_ids[classifier_free_mask] = self.unconditional_input_ids.to(input_ids.device)
+
+        # encode image into latents
+        latents = self.encode_image(pixel_values)
+
+        # Sample noise
+        noise = torch.randn_like(latents)
+        bsz = latents.shape[0]
+        # Sample a random timestep for each image
+        timesteps = torch.randint(0, self.noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
+        timesteps = timesteps.long()
+
+        # Add noise to the latents according to the noise magnitude at each timestep (forward diffusion process)
+        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+
+        # Get the target for loss depending on the prediction type
+        if self.noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.noise_scheduler.config.prediction_type == "v_prediction":
+            target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+
+        # get text condition
+        encoder_hidden_states = self.text_encoder(input_ids)[0]
+
+        # run unet
+        model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        if self.use_pixel_loss:
+            latent_pred = self.get_image_pred(model_pred, timesteps, noisy_latents)
+            image_pred = self.decode_latents(latent_pred)
+            image_pred = torch.clamp(image_pred, -1, 1)
+            loss = F.mse_loss(image_pred.float(), pixel_values.float(), reduction="mean")
+        else:
+            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+        return loss
+
+    def enable_gradient_checkpointing(self):
+        self.unet.enable_gradient_checkpointing()
+        self.text_encoder.gradient_checkpointing_enable()
+
+
+def log_to_wandb(images, gt_images, captions, scores, gt_scores, global_step):
+    logger.info("Uploading to wandb")
+    images = [wandb.Image(img) for img in images]
+    gt_images = [wandb.Image(img) for img in gt_images]
+    predictions = [captions, images, gt_images, scores, gt_scores,
+                   [global_step] * len(captions)]
+    columns = ["prompt", "image", "gt_image", "score", "gt_score", "global_step"]
+    data = list(zip(*predictions))
+    table = wandb.Table(columns=columns, data=data)
+    wandb.log({"test_predictions": table}, commit=False, step=global_step)
+
+
+def clean_ckpts(output_dir, max_ckpts_to_keep):
+    all_ckpts = list(glob(os.path.join(output_dir, f"epoch-*")))
+    all_ckpts.sort(key=os.path.getctime)
+    if len(all_ckpts) > max_ckpts_to_keep:
+        for ckpt in all_ckpts[:-max_ckpts_to_keep]:
+            shutil.rmtree(ckpt)
+
+
+def get_latest_ckpt_path(output_dir):
+    all_ckpts = list(glob(os.path.join(output_dir, f"epoch-*")))
+    all_ckpts.sort(key=os.path.getctime)
+    if len(all_ckpts) > 0:
+        return all_ckpts[-1]
+    return None
+
+
+def flatten(list_of_lists):
+    return [item for sublist in list_of_lists for item in sublist]
+
+
+def extract_from_ckpt_path(ckpt_path):
+    ckpt_path = os.path.basename(ckpt_path)
+    ints = ckpt_path.replace("epoch-", "").replace("global_step-", "").replace("step-", "").split("_")
+    start_epoch, start_step, global_step = [int(i) for i in ints]
+    return start_epoch, start_step, global_step
+
+
 @hydra.main(config_path="../../configs/finetune", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
+    def clean_output_dir():
+        if os.path.exists(cfg.general.output_dir):
+            if cfg.general.overwrite_output_dir:
+                logger.info(f"Overwriting {cfg.general.output_dir}")
+                shutil.rmtree(cfg.general.output_dir)
+
+        logger.info(f"Will write to {os.path.realpath(cfg.general.output_dir)}")
+        os.makedirs(cfg.general.output_dir, exist_ok=True)
+
+    def set_logging_level():
+        if accelerator.is_local_main_process:
+            datasets.utils.logging.set_verbosity_warning()
+            transformers.utils.logging.set_verbosity_warning()
+            diffusers.utils.logging.set_verbosity_info()
+        else:
+            datasets.utils.logging.set_verbosity_error()
+            transformers.utils.logging.set_verbosity_error()
+            diffusers.utils.logging.set_verbosity_error()
+
     logging_dir = os.path.join(cfg.general.output_dir, cfg.general.logging_dir)
 
     accelerator = Accelerator(
@@ -191,59 +256,58 @@ def main(cfg: DictConfig) -> None:
     )
 
     if accelerator.is_main_process:
-        if os.path.exists(cfg.general.output_dir):
-            if cfg.general.overwrite_output_dir:
-                shutil.rmtree(cfg.general.output_dir)
-            else:
-                raise ValueError(f"Output directory {cfg.general.output_dir} already exists!")
-
-        logger.info(f"Will write to {os.path.realpath(cfg.general.output_dir)}")
-        os.makedirs(cfg.general.output_dir, exist_ok=True)
-
+        clean_output_dir()
         print_config(cfg)
-
         if cfg.debug.activate:
             debug(cfg.debug.port)
 
-    if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_warning()
-        diffusers.utils.logging.set_verbosity_info()
-    else:
-        datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
-        diffusers.utils.logging.set_verbosity_error()
+    set_logging_level()
 
     if cfg.training.seed is not None:
         set_seed(cfg.training.seed, device_specific=True)
 
-    logger.info("Loading model")
+    logger.info("Loading model and scheduler")
     pipeline = StableDiffusionPipeline.from_pretrained(cfg.training.pretrained_model_name_or_path)
+    noise_scheduler = DDPMScheduler.from_pretrained(
+        cfg.training.pretrained_model_name_or_path,
+        prediction_type=cfg.training.prediction_type,
+        subfolder="scheduler"
+    )
+
     pipeline.safety_checker = None
     tokenizer = pipeline.tokenizer
     text_encoder = pipeline.text_encoder
     vae = pipeline.vae
     unet = pipeline.unet
 
-    if cfg.training.use_ema:
-        ema_unet = EMAModel(unet)
+    if not cfg.training.train_unet:
+        logger.info("Freezing unet")
+        unet.requires_grad_(False)
 
-    logger.info("Loaded model")
+    if not cfg.training.train_text_encoder:
+        logger.info("Freezing text encoder")
+        text_encoder.requires_grad_(False)
 
-    if cfg.training.enable_xformers_memory_efficient_attention:
-        logger.info("Enabling memory efficient attention")
-        if is_xformers_available():
-            unet.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
+    if not cfg.training.train_vae:
+        logger.info("Freezing vae")
+        vae.requires_grad_(False)
+
+    unconditional_input_ids = tokenizer("", max_length=tokenizer.model_max_length, padding="max_length",
+                                        truncation=True, return_tensors="pt").input_ids
+
+    model = Model(
+        unet,
+        text_encoder,
+        vae,
+        unconditional_input_ids,
+        cfg.training.classifier_free_ratio,
+        noise_scheduler,
+        cfg.training.use_pixel_loss
+    )
 
     if cfg.training.gradient_checkpointing:
         logger.info("Enabling gradient checkpointing")
-        unet.enable_gradient_checkpointing()
-
-    logger.info("Freezing text encoder and vae")
-    text_encoder.requires_grad_(False)
-    vae.requires_grad_(False)
+        model.enable_gradient_checkpointing()
 
     logger.info("Loading CLIP (for validation)")
     clip_processor = CLIPProcessor.from_pretrained(cfg.training.eval_clip_id)
@@ -256,12 +320,9 @@ def main(cfg: DictConfig) -> None:
                                                             subfolder="scheduler")
     pipeline.scheduler = scheduler
 
-    logger.info("Loading scheduler (for training")
-    noise_scheduler = DDPMScheduler.from_pretrained(cfg.training.pretrained_model_name_or_path, subfolder="scheduler")
-
     logger.info("Initializing optimizer")
     optimizer = torch.optim.AdamW(
-        unet.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=cfg.optimizer.learning_rate,
         betas=(cfg.optimizer.adam_beta1, cfg.optimizer.adam_beta2),
         weight_decay=cfg.optimizer.adam_weight_decay,
@@ -275,12 +336,15 @@ def main(cfg: DictConfig) -> None:
         cache_dir=cfg.general.cache_dir,
     )
 
+    if cfg.dataset.max_examples is not None:
+        logger.info(f"Limiting dataset to {cfg.dataset.max_examples} examples")
+        for split in dataset:
+            dataset[split] = dataset[split].select(list(range(min(cfg.dataset.max_examples, len(dataset[split])))))
+
     logger.info("Configuring dataset preprocessing")
-    image_column_name = cfg.dataset.image_column_name
-    caption_column_name = cfg.dataset.caption_column_name
 
     def tokenize_captions(examples):
-        captions = examples[caption_column_name]
+        captions = examples[cfg.dataset.caption_column_name]
         inputs = tokenizer(
             captions,
             max_length=tokenizer.model_max_length,
@@ -302,13 +366,13 @@ def main(cfg: DictConfig) -> None:
 
     def preprocess(examples):
         examples["input_ids"] = tokenize_captions(examples)
-        examples["pixel_values"] = [train_transforms(image) for image in examples[image_column_name]]
+        examples["pixel_values"] = [train_transforms(image) for image in examples[cfg.dataset.image_column_name]]
         return examples
 
     with accelerator.main_process_first():
         train_dataset = dataset["train"].with_transform(preprocess)
         # TODO change to test
-        validation_dataset = dataset["train"].with_transform(preprocess)
+        validation_dataset = dataset["validation"].with_transform(preprocess)
 
     def collate_fn(examples):
         input_ids = torch.stack([example["input_ids"] for example in examples])
@@ -352,29 +416,9 @@ def main(cfg: DictConfig) -> None:
     )
 
     logger.info("Preparing training with accelerator")
-    unet, optimizer, train_dataloader, validation_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, validation_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, validation_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, validation_dataloader, lr_scheduler
     )
-
-    if cfg.training.use_ema:
-        accelerator.register_for_checkpointing(ema_unet)
-
-    weight_dtype = torch.float32
-    if cfg.training.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif cfg.training.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
-    logger.info(f"Moving text encoder and vae to GPU with weight dtype {weight_dtype}")
-    text_encoder = text_encoder.to(accelerator.device, dtype=weight_dtype)
-    vae = vae.to(accelerator.device, dtype=weight_dtype)
-
-    pipeline.unet = unet
-
-    logger.info(f"GPU memory usage before training {get_allocated_cuda_memory()}")
-
-    if cfg.training.use_ema:
-        ema_unet.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / cfg.training.gradient_accumulation_steps)
@@ -383,56 +427,8 @@ def main(cfg: DictConfig) -> None:
     # Afterwards we recalculate our number of training epochs
     cfg.training.num_train_epochs = math.ceil(cfg.training.max_train_steps / num_update_steps_per_epoch)
 
-    if accelerator.is_main_process:
-        accelerator.init_trackers("text2image-fine-tune", config=OmegaConf.to_object(cfg))
-
-    logger.info("Preparing unconditional input")
-
-    def train_forward(batch):
-        pixel_values = batch["pixel_values"]
-        input_ids = batch["input_ids"]
-
-        # classifier free
-        unconditional_input_ids = tokenizer("", max_length=tokenizer.model_max_length, padding="max_length",
-                                            truncation=True, return_tensors="pt").input_ids
-        unconditional_input_ids = unconditional_input_ids.to(accelerator.device)
-        classifier_free_mask = torch.rand(size=(input_ids.shape[0],)) < cfg.training.classifier_free_ratio
-        input_ids[classifier_free_mask] = unconditional_input_ids
-
-        latents = vae.encode(pixel_values.to(weight_dtype)).latent_dist.sample()
-        latents = latents * 0.18215
-
-        # Sample noise that we'll add to the latents
-        noise = torch.randn_like(latents)
-        bsz = latents.shape[0]
-        # Sample a random timestep for each image
-        timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
-        timesteps = timesteps.long()
-
-        # Add noise to the latents according to the noise magnitude at each timestep
-        # (this is the forward diffusion process)
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-        # Get the text embedding for conditioning
-        encoder_hidden_states = text_encoder(input_ids)[0]
-
-        # Get the target for loss depending on the prediction type
-        if noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif noise_scheduler.config.prediction_type == "v_prediction":
-            target = noise_scheduler.get_velocity(latents, noise, timesteps)
-        else:
-            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-        # Predict the noise residual and compute loss
-        model_out = unet(noisy_latents, timesteps, encoder_hidden_states)
-        model_pred = model_out.sample
-        return model_pred, target
-
-    def train_step(batch):
-        model_pred, target = train_forward(batch)
-
-        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+    def train_step(pixel_values, input_ids):
+        loss = model(pixel_values, input_ids)
 
         # Gather the losses across all processes for logging (if we use distributed training).
         avg_loss = accelerator.gather(loss).mean().item()
@@ -440,7 +436,8 @@ def main(cfg: DictConfig) -> None:
         # Backpropagate
         accelerator.backward(loss)
         if accelerator.sync_gradients:
-            accelerator.clip_grad_norm_(unet.parameters(), cfg.optimizer.max_grad_norm)
+            accelerator.clip_grad_norm_(model.parameters(), cfg.optimizer.max_grad_norm)
+
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
@@ -461,19 +458,16 @@ def main(cfg: DictConfig) -> None:
         gt_img_score = round(gt_img_score, 3)
         return img_score, gt_img_score
 
-    def evaluate():
-        logger.info("***** Generating from Validation *****")
-        unet.eval()
-        pipeline.set_progress_bar_config(disable=True)
-
+    def generate_validation():
         valid_progress_bar = tqdm(disable=not accelerator.is_main_process)
         valid_progress_bar.set_description("#Batches Generated")
+
         captions, images, gt_images = [], [], []
         generator = torch.Generator(device=accelerator.device)
+        generator.manual_seed(cfg.training.seed)
 
         for eval_step, val_batch in enumerate(validation_dataloader):
             batch_captions = tokenizer.batch_decode(val_batch["input_ids"], skip_special_tokens=True)
-            generator.manual_seed(cfg.training.seed)
             batch_images = pipeline(batch_captions,
                                     guidance_scale=cfg.training.gs,
                                     generator=generator,
@@ -485,65 +479,90 @@ def main(cfg: DictConfig) -> None:
             if len(captions) >= cfg.training.max_batches_to_generate * cfg.training.validation_batch_size:
                 break
 
+        return captions, images, gt_images
+
+    def run_clip_score(captions, images, gt_images):
         scores, gt_scores = [], []
         for caption, img, gt_img in zip(captions, images, gt_images):
             img_score, gt_img_score = get_image_scores(caption, img, gt_img)
             scores.append(img_score)
             gt_scores.append(gt_img_score)
+        return scores, gt_scores
+
+    def gather_iterable(it):
+        output_objects = [None for _ in range(accelerator.num_processes)]
+        torch.distributed.all_gather_object(output_objects, it)
+        return flatten(output_objects)
+
+    def evaluate():
+        logger.info("***** Generating from Validation *****")
+        model.eval()
+        pipeline.set_progress_bar_config(disable=True)
+
+        captions, images, gt_images = generate_validation()
+        scores, gt_scores = run_clip_score(captions, images, gt_images)
+
+        log_data = [captions, images, gt_images, scores, gt_scores]
+        captions, images, gt_images, scores, gt_scores = [gather_iterable(dp) for dp in log_data]
 
         # Log predictions
         if cfg.general.report_to == "wandb" and accelerator.is_main_process:
-            logger.info("Uploading to wandb")
-            images = [wandb.Image(img) for img in images]
-            gt_images = [wandb.Image(img) for img in gt_images]
-            predictions = [captions, images, gt_images, scores, gt_scores,
-                           [global_step] * len(captions)]
-            columns = ["prompt", "image", "gt_image", "score", "gt_score", "global_step"]
-            data = list(zip(*predictions))
-            table = wandb.Table(columns=columns, data=data)
-            wandb.log({"test_predictions": table}, commit=False, step=global_step)
+            log_to_wandb(images, gt_images, captions, scores, gt_scores, global_step)
 
         logger.info(f"Finished Validation")
         torch.cuda.empty_cache()
-        unet.train()
+        model.train()
         accelerator.wait_for_everyone()
 
-    def clean_ckpts():
-        all_ckpts = list(glob(os.path.join(cfg.general.output_dir, f"global_step*")))
-        all_ckpts.sort(key=os.path.getctime)
-        if len(all_ckpts) > cfg.general.max_ckpts_to_keep:
-            for ckpt in all_ckpts[:-cfg.general.max_ckpts_to_keep]:
-                shutil.rmtree(ckpt)
+    start_epoch, start_step, continuing, global_step = None, None, False, 0
+    if cfg.training.continue_from_checkpoint:
+        ckpt_path = get_latest_ckpt_path(cfg.general.output_dir)
+        if ckpt_path is not None:
+            continuing = True
+            start_epoch, start_step, global_step = extract_from_ckpt_path(ckpt_path)
+            logger.info(f"Loading state from {ckpt_path} - epoch {start_epoch}, step {start_step}, global_step {global_step}")
+            accelerator.load_state(ckpt_path)
+
+    if accelerator.is_main_process:
+        accelerator.init_trackers("text2image-fine-tune", config=OmegaConf.to_object(cfg))
 
     logger.info("Training")
-    # Train!
     total_batch_size = cfg.training.train_batch_size * accelerator.num_processes * cfg.training.gradient_accumulation_steps
     logger.info("***** Running training *****")
+    logger.info(f"  GPU memory usage before training {get_allocated_cuda_memory()}")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {cfg.training.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {cfg.training.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {cfg.training.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {cfg.training.max_train_steps}")
-    logger.info(f"  Using weight_dtype = {weight_dtype}")
-    logger.info(f"  Using classifier_free_ratio = {cfg.training.classifier_free_ratio}")
+    logger.info(f"  Mixed precision = {cfg.training.mixed_precision}")
+    logger.info(f"  Classifier free ratio = {cfg.training.classifier_free_ratio}")
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(cfg.training.max_train_steps), disable=not accelerator.is_main_process)
     progress_bar.set_description("Steps")
-    global_step = 0
 
     for epoch in range(cfg.training.num_train_epochs):
-        unet.train()
+        model.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet):
-                avg_loss = train_step(batch)
+            if continuing and epoch < start_epoch or (epoch == start_epoch and step < start_step):
+                progress_bar.update(1)
+                progress_bar.set_postfix(**{"status": "skipping"})
+                continue
+            with accelerator.accumulate(model):
+
+                is_start_train = step == 0 and epoch == 0
+                should_eval = accelerator.sync_gradients and global_step % cfg.training.validate_steps == 0
+                if is_start_train or should_eval:
+                    evaluate()
+
+                avg_loss = train_step(**batch)
+                torch.cuda.empty_cache()
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 train_loss += avg_loss / cfg.training.gradient_accumulation_steps
                 if accelerator.sync_gradients:
-                    if cfg.training.use_ema:
-                        ema_unet.step(unet.parameters())
                     global_step += 1
                     progress_bar.update(1)
                     accelerator.log(
@@ -567,21 +586,13 @@ def main(cfg: DictConfig) -> None:
 
                 # Save checkpoint
                 if accelerator.sync_gradients and global_step % cfg.training.save_steps == 0:
-                    if cfg.training.use_ema:
-                        # TODO not sure if this is the right way to do it
-                        ema_unet.copy_to(unet.parameters())
                     save_dir = cfg.general.output_dir
                     os.makedirs(save_dir, exist_ok=True)
-                    save_dir = os.path.join(cfg.general.output_dir, f"global_step_{global_step}")
+                    save_dir = os.path.join(cfg.general.output_dir,
+                                            f"epoch-{epoch}_step-{step}_global_step-{global_step}")
                     accelerator.save_state(save_dir)
                     if accelerator.is_main_process:
-                        clean_ckpts()
-
-                # Evaluate
-                is_start_train = step == 0 and epoch == 0
-                should_eval = accelerator.sync_gradients and global_step % cfg.training.validate_steps == 0
-                if is_start_train or should_eval:
-                    evaluate()
+                        clean_ckpts(cfg.general.output_dir, cfg.general.max_ckpts_to_keep)
 
             if global_step >= cfg.training.max_train_steps:
                 break
