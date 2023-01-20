@@ -580,7 +580,9 @@ def main(cfg: DictConfig) -> None:
                     "step_loss": avg_loss,
                     "lr": lr_scheduler.get_last_lr()[0],
                     "mem": cuda_gb_allocated,
-                    "epoch": epoch
+                    "step": step,
+                    "epoch": epoch,
+                    "global_step": global_step,
                 }
                 progress_bar.set_postfix(**logs)
 
