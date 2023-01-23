@@ -1,39 +1,49 @@
 general:
   output_dir: outputs/finetune_sd
-  overwrite_output_dir: true
+  overwrite_output_dir: false
   logging_dir: logs
   report_to: wandb
   cache_dir: null
   max_ckpts_to_keep: 3
 
 training:
+  deepspeed_config_path: configs/finetune/deepspeed.json
   gradient_accumulation_steps: 1
   mixed_precision: "no"
   seed: 42
   pretrained_model_name_or_path: runwayml/stable-diffusion-v1-5
+  prediction_type: epsilon
   gradient_checkpointing: true
   train_batch_size: 1
   validation_batch_size: 1
   resolution: 512
-  max_train_steps: 10000
+  max_train_steps: 500
   num_train_epochs: 10
   use_ema: false
   validate_steps: 100
-  save_steps: 1000 # ${training.validate_steps}
+  save_steps: 100 # ${training.validate_steps}
   max_batches_to_generate: 8
   classifier_free_ratio: 0.1
   enable_xformers_memory_efficient_attention: false
   eval_clip_id: openai/clip-vit-large-patch14
   n_eval_steps: 25
-  gs: 9
+  gs: 7
   num_workers: 3
+  train_unet: true
+  train_text_encoder: true
+  train_vae: false
+  use_pixel_loss: true
+  continue_from_checkpoint: true
+  add_face_loss: false
+  deepspeed: null
+  eval_on_start_train: true
 
 dataset:
-  dataset_name: yuvalkirstain/beautiful_interesting_spectacular_photo_model_30000
+  dataset_name: yuvalkirstain/pexel_people
   dataset_config_name: null
   image_column_name: image
-  caption_column_name: text
-  bad_image_column_name: bad_image
+  caption_column_name: generated_caption
+  max_examples: null
 
 optimizer:
   learning_rate: 1e-6
@@ -46,7 +56,7 @@ optimizer:
 
 lr_scheduler:
   type: constant_with_warmup
-  lr_warmup_steps: 500
+  lr_warmup_steps: 250
 
 hf:
   push_to_hub: true
