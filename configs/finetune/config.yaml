@@ -8,21 +8,21 @@ general:
 
 training:
   deepspeed_config_path: configs/finetune/deepspeed.json
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   mixed_precision: "no"
   seed: 42
   pretrained_model_name_or_path: runwayml/stable-diffusion-v1-5
   prediction_type: epsilon
   gradient_checkpointing: true
-  train_batch_size: 1
-  validation_batch_size: 1
+  train_batch_size: 2
+  validation_batch_size: 4
   resolution: 512
-  max_train_steps: 500
+  max_train_steps: 2000
   num_train_epochs: 10
   use_ema: false
   validate_steps: 100
   save_steps: 100 # ${training.validate_steps}
-  max_batches_to_generate: 8
+  max_batches_to_generate: 1
   classifier_free_ratio: 0.1
   enable_xformers_memory_efficient_attention: false
   eval_clip_id: openai/clip-vit-large-patch14
@@ -32,17 +32,18 @@ training:
   train_unet: true
   train_text_encoder: true
   train_vae: false
-  use_pixel_loss: true
+  use_pixel_loss: false
   continue_from_checkpoint: true
   add_face_loss: false
   deepspeed: null
   eval_on_start_train: true
+  take_clip_score_on_eval: false
 
 dataset:
-  dataset_name: yuvalkirstain/pexel_people
+  dataset_name: yuvalkirstain/PickaPic-ft-ranked
   dataset_config_name: null
   image_column_name: image
-  caption_column_name: generated_caption
+  caption_column_name: text
   max_examples: null
 
 optimizer:
@@ -69,3 +70,9 @@ debug:
 hydra:
   run:
     dir: .
+
+slurm:
+  job_name: ft
+  partition: killable
+  time_limit: 20
+  n_processes: 4
