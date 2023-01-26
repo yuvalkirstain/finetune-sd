@@ -128,7 +128,8 @@ def main(cfg: DictConfig) -> None:
         model.enable_gradient_checkpointing()
 
     logger.info("Loading CLIP (for validation)")
-    clip_model, clip_processor = load_clip_for_eval(cfg.training.eval_clip_id, accelerator.device)
+    if cfg.training.take_clip_score_on_eval:
+        clip_model, clip_processor = load_clip_for_eval(cfg.training.eval_clip_id, accelerator.device)
 
     logger.info("Loading scheduler (for validation + save)")
     scheduler = DPMSolverMultistepScheduler.from_pretrained(cfg.training.pretrained_model_name_or_path,
@@ -156,9 +157,8 @@ def main(cfg: DictConfig) -> None:
         cfg.dataset.caption_column_name,
         cfg.dataset.image_column_name
     )
-    # TODO change to test
     validation_dataset = Dataset(
-        dataset["train"],
+        dataset["validation"],
         tokenizer,
         cfg.training.resolution,
         False,
@@ -266,7 +266,10 @@ def main(cfg: DictConfig) -> None:
         pipeline.set_progress_bar_config(disable=True)
 
         captions, images, gt_images = generate_validation()
-        scores, gt_scores = run_clip_score(captions, images, gt_images)
+        if cfg.training.take_clip_score_on_eval:
+            scores, gt_scores = run_clip_score(captions, images, gt_images)
+        else:
+            scores, gt_scores = [0] * len(captions), [0] * len(captions)
 
         log_data = [captions, images, gt_images, scores, gt_scores]
         captions, images, gt_images, scores, gt_scores = [gather_iterable(dp, accelerator.num_processes) for dp in
@@ -317,7 +320,7 @@ def main(cfg: DictConfig) -> None:
     for epoch in range(cfg.training.num_train_epochs):
         model.train()
         train_loss = 0.0
-
+        global_step_loss = 0.0
         for step, batch in enumerate(train_dataloader):
 
             if cfg.debug.activate:
@@ -351,6 +354,7 @@ def main(cfg: DictConfig) -> None:
             # Checks if the accelerator has performed an optimization step behind the scenes
             train_loss += avg_loss / cfg.training.gradient_accumulation_steps
             if accelerator.sync_gradients:
+                global_step_loss = train_loss
                 global_step += 1
                 progress_bar.update(1)
                 accelerator.log(
@@ -365,11 +369,12 @@ def main(cfg: DictConfig) -> None:
 
             cuda_gb_allocated = get_allocated_cuda_memory(accelerator.device)
             logs = {
-                "step_loss": avg_loss,
+                "stl": avg_loss,
+                "gstl": global_step_loss,
                 "mem": cuda_gb_allocated,
-                "step": step,
-                "epoch": epoch,
-                "global_step": global_step,
+                "st": step,
+                "ep": epoch,
+                "gst": global_step,
             }
             if global_step > 0:
                 logs["lr"] = lr_scheduler.get_last_lr()[0]
