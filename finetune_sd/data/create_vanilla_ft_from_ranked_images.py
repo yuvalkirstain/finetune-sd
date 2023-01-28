@@ -1,32 +1,8 @@
 import os.path
-from glob import glob
-from io import BytesIO
 from multiprocessing import Pool
-
-from PIL import Image
 from datasets import load_dataset, concatenate_datasets, Dataset, load_from_disk
 from img2dataset import download
-from tqdm import tqdm
-
-
-def parquet2dataset(parquet_path: str):
-    datasets = []
-    for path in glob(f"{parquet_path}/*.parquet"):
-        datasets.append(load_dataset("parquet", data_files=path)["train"])
-    dataset = concatenate_datasets(datasets)
-    return dataset
-
-
-def bytes2image(bytes: bytes):
-    image = Image.open(BytesIO(bytes))
-    image = image.convert("RGB")
-    return image
-
-
-def dataset2images(dataset, pool):
-    image_bytes = dataset["jpg"]
-    images = list(tqdm(pool.imap(bytes2image, image_bytes), total=len(image_bytes)))
-    return images
+from utils import parquet2dataset, dataset2images, filter_dataset_by_text
 
 
 def main():
@@ -64,29 +40,9 @@ def main():
     best_images_dataset = images_dataset.filter(
         lambda x:
         x['image_uid'] in best_image_uids and
-        x['prompt'] not in eval_prompts and
-        x['prompt'].strip().lower() != "A mature poodle toy.".lower() and
-        "busty" not in x['prompt'].lower() and
-        "boobs" not in x['prompt'].lower() and
-        "gay" not in x['prompt'].lower() and
-        "shirtless" not in x['prompt'].lower() and
-        "nude" not in x['prompt'].lower() and
-        "revealing" not in x['prompt'].lower() and
-        "naked" not in x['prompt'].lower() and
-        "breasts" not in x['prompt'].lower() and
-        "amouranth" not in x['prompt'].lower() and
-        "nigger" not in x['prompt'].lower() and
-        "sussy" not in x['prompt'].lower() and
-        "tits" not in x['prompt'].lower() and
-        "lingerie" not in x['prompt'].lower() and
-        "trump" not in x['prompt'].lower() and
-        "sex" not in x['prompt'].lower() and
-        "bikini" not in x['prompt'].lower() and
-        "netanyahu" not in x['prompt'].lower() and
-        "jewish" not in x['prompt'].lower() and
-        "putin" not in x['prompt'].lower() and
-        len(x["prompt"].strip()) > 2
+        x['prompt'] not in eval_prompts
     )
+    best_images_dataset = filter_dataset_by_text(best_images_dataset)
 
     print("Saving urls for img2dataset...")
     best_images_dataset.to_parquet(urls_out_path)

@@ -1,33 +1,9 @@
 import os.path
 import random
-from glob import glob
-from io import BytesIO
 from multiprocessing import Pool
-
-from PIL import Image
 from datasets import load_dataset, concatenate_datasets, Dataset, load_from_disk
 from img2dataset import download
-from tqdm import tqdm
-
-
-def parquet2dataset(parquet_path: str):
-    datasets = []
-    for path in sorted(glob(f"{parquet_path}/*.parquet")):
-        datasets.append(load_dataset("parquet", data_files=path)["train"])
-    dataset = concatenate_datasets(datasets)
-    return dataset
-
-
-def bytes2image(bytes: bytes):
-    image = Image.open(BytesIO(bytes))
-    image = image.convert("RGB")
-    return image
-
-
-def dataset2images(dataset, pool, col):
-    image_bytes = dataset[col]
-    images = list(tqdm(pool.imap(bytes2image, image_bytes), total=len(image_bytes)))
-    return images
+from utils import parquet2dataset, dataset2images, filter_dataset_by_text
 
 
 def main():
@@ -36,7 +12,7 @@ def main():
     images_good_out_path = f"data/images/PickaPic_reward_good.parquet"
     images_bad_out_path = f"data/images/PickaPic_reward_bad.parquet"
     dataset_out_path = f"data/datasets/PickaPic_reward.ds"
-    dataset_hub_name = "PickaPic-ft-reward"
+    dataset_hub_name = "PickaPic-ft-pairwise"
 
     process_count = 16
     thread_count = 32
@@ -67,30 +43,9 @@ def main():
 
     decision_ranking_dataset = decision_ranking_dataset.filter(
         lambda x:
-        x[text_col] not in eval_prompts and
-        x[text_col].strip().lower() != "A mature poodle toy.".lower() and
-        x[text_col].strip().lower() != "A mature toy poodle.".lower() and
-        "busty" not in x[text_col].lower() and
-        "boobs" not in x[text_col].lower() and
-        "gay" not in x[text_col].lower() and
-        "shirtless" not in x[text_col].lower() and
-        "nude" not in x[text_col].lower() and
-        "revealing" not in x[text_col].lower() and
-        "naked" not in x[text_col].lower() and
-        "breasts" not in x[text_col].lower() and
-        "amouranth" not in x[text_col].lower() and
-        "nigger" not in x[text_col].lower() and
-        "sussy" not in x[text_col].lower() and
-        "tits" not in x[text_col].lower() and
-        "lingerie" not in x[text_col].lower() and
-        "trump" not in x[text_col].lower() and
-        "sex" not in x[text_col].lower() and
-        "bikini" not in x[text_col].lower() and
-        "netanyahu" not in x[text_col].lower() and
-        "jewish" not in x[text_col].lower() and
-        "putin" not in x[text_col].lower() and
-        len(x[text_col].strip()) > 2
+        x[text_col] not in eval_prompts
     )
+    decision_ranking_dataset = filter_dataset_by_text(decision_ranking_dataset)
 
     df = decision_ranking_dataset.to_pandas()
     df = df.sort_values("created_at").drop_duplicates("prompt")
@@ -151,7 +106,6 @@ def main():
         )
     else:
         print("Bad images already downloaded.")
-
 
     if not os.path.exists(dataset_out_path):
         print("Reading downloaded images...")
