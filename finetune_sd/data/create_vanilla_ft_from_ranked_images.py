@@ -42,7 +42,7 @@ def main():
         x['image_uid'] in best_image_uids and
         x['prompt'] not in eval_prompts
     )
-    best_images_dataset = filter_dataset_by_text(best_images_dataset)
+    best_images_dataset = filter_dataset_by_text(best_images_dataset, text_col)
 
     print("Saving urls for img2dataset...")
     best_images_dataset.to_parquet(urls_out_path)

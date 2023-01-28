@@ -45,7 +45,7 @@ def main():
         lambda x:
         x[text_col] not in eval_prompts
     )
-    decision_ranking_dataset = filter_dataset_by_text(decision_ranking_dataset)
+    decision_ranking_dataset = filter_dataset_by_text(decision_ranking_dataset, text_col)
 
     df = decision_ranking_dataset.to_pandas()
     df = df.sort_values("created_at").drop_duplicates("prompt")
