@@ -1,0 +1,28 @@
+paths:
+  urls_out_path: data/urls/PickaPic_reward.parquet
+  images_good_out_path: data/images/PickaPic_reward_good.parquet
+  images_bad_out_path: data/images/PickaPic_reward_bad.parquet
+  dataset_out_path: data/datasets/PickaPic_reward.ds
+  dataset_hub_name: PickaPic-ft-pairwise
+  ranking_dataset_name: yuvalkirstain/PickaPic-rankings
+  eval_dataset_name: yuvalkirstain/PickaPic-random-prompts
+
+download:
+  process_count: 16
+  thread_count: 32
+  image_size: 512
+  resize_mode: center_crop
+  num_samples_per_shard: 1000
+
+dataset_columns:
+  url_good_col: url_good
+  url_bad_col: url_bad
+  best_uid_col: best_image_uid
+  uid_bad_col: bad_image_uid
+  text_col: prompt
+
+others:
+  ratio: 0.2
+
+
+
